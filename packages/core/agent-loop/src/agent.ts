@@ -387,7 +387,9 @@ export class ReactLoopAgent implements Agent {
     const { assembly } = decision
     const renderedPrompt = renderPrompt(assembly)
     let firstAttempt = true
+    let retriedInvalidToolCall = false
     while (true) {
+      signal.throwIfAborted()
       const { config, preparedCall } = await this.prepareRequest(turn, step, signal)
       const startsRequestSeries = firstAttempt && decision.startsRequestSeries === true
       const commits = this.systemPrompt.project(renderedPrompt, {
@@ -474,6 +476,10 @@ export class ReactLoopAgent implements Agent {
             'assistant/attempt',
             () => this.session.append('assistant/attempt', { turn, step, stream: live.stream }).seq,
           )
+          if (retriedInvalidToolCall) {
+            signal.throwIfAborted()
+            throw new LlmError(finish.failure.message, finish.failure.code, finish.failure)
+          }
           const action = await this.dispatch.waterfall(
             'agent/request-error', {
               turn,
@@ -492,8 +498,27 @@ export class ReactLoopAgent implements Agent {
           continue
         }
 
+        const content = live.blocks()
+        // Validate the completed batch before advertising or starting any of its calls.
+        // Streaming fragments can acquire their identities later in the same response.
+        if (content.some(block => block.type === 'tool-call' && (
+          typeof block.id !== 'string' || block.id.trim() === ''
+          || typeof block.name !== 'string' || block.name.trim() === ''
+        ))) {
+          live.settle(
+            'assistant/attempt',
+            () => this.session.append('assistant/attempt', { turn, step, stream: live.stream }).seq,
+          )
+          signal.throwIfAborted()
+          if (retriedInvalidToolCall) {
+            throw new LlmError('Model returned a tool call without a valid ID or name after one retry', 'INVALID_TOOL_CALL_IDENTITY')
+          }
+          retriedInvalidToolCall = true
+          this.loopCtx.logger.warn(`INVALID_TOOL_CALL_IDENTITY in turn ${turn} step ${step}: retrying the model request once`)
+          continue
+        }
         const message = createAssistantMessage({
-          content: live.blocks(),
+          content,
           source: {
             provider: request.provider,
             model: request.model,

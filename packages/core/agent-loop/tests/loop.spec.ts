@@ -73,6 +73,73 @@ function userTexts(agent: Agent): string[] {
 }
 
 describe('agent loop', () => {
+  it('retries a mixed tool batch before any execution and accepts identities supplied at block end', async () => {
+    const rejected: StreamChunk[] = [
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: ToolCallId('rejected'), name: 'count', arguments: '{}' } },
+      { type: 'block-end', index: 1, block: { type: 'tool-call', id: ToolCallId(''), name: '', arguments: '{}' } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ]
+    const recovered: StreamChunk[] = [
+      { type: 'block-start', index: 0, blockType: 'tool-call' },
+      { type: 'tool-call-delta', index: 0, id: ToolCallId(''), argumentsDelta: '' },
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: ToolCallId('accepted'), name: 'count', arguments: '{}' } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ]
+    const adapter = new MockAdapter([rejected, recovered, textResponse('done')])
+    const ctx = await harness(adapter)
+    try {
+      let executions = 0
+      ctx.tools.register(defineContentToolFixture({
+        name: 'count', description: 'Count executions', parameters: {},
+        async execute() { executions++; return [{ type: 'text', text: 'counted' }] },
+      }))
+      const agent = await ctx.agentLoop.create(SessionId('recover-tool-identity'), { provider: 'mock', model: 'mock' })
+      send(agent, 'run')
+      await agent.whenIdle()
+      const events = agent.session.snapshotEvents()
+      expect(executions).toBe(1)
+      expect(adapter.requests).toHaveLength(3)
+      expect(adapter.requests[1]?.messages).toEqual(adapter.requests[0]?.messages)
+      expect(events.filter(e => e.type === 'assistant/attempt')).toHaveLength(1)
+      expect(events.filter(e => e.type === 'tool/call').map(e => e.data.callId)).toEqual(['accepted'])
+      expect(events.filter(e => e.type === 'tool/result')).toHaveLength(1)
+      expect(events.find(e => e.type === 'turn/end')?.data.reason).toEqual({ kind: 'completed' })
+    } finally { await ctx.fiber.dispose() }
+  })
+
+  it('preserves a max-tokens finish with an incomplete tool identity', async () => {
+    const adapter = new MockAdapter([[
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: ToolCallId(''), name: '', arguments: '{}' } },
+      { type: 'finish', reason: { kind: 'max-tokens' } },
+    ]])
+    const ctx = await harness(adapter)
+    try {
+      const agent = await ctx.agentLoop.create(SessionId('truncated-identity'), { provider: 'mock', model: 'mock' })
+      send(agent, 'run')
+      await agent.whenIdle()
+      const events = agent.session.snapshotEvents()
+      expect(adapter.requests).toHaveLength(1)
+      expect(events.some(e => e.type === 'tool/call' || e.type === 'assistant/attempt')).toBe(false)
+      expect(events.find(e => e.type === 'turn/end')?.data.reason).toEqual({ kind: 'max-tokens' })
+    } finally { await ctx.fiber.dispose() }
+  })
+
+  it('honors cancellation during the replacement request without dispatching the rejected call', async () => {
+    const adapter = new MockAdapter([toolCallResponse('', 'count', {}), 'hang'])
+    const ctx = await harness(adapter)
+    try {
+      const agent = await ctx.agentLoop.create(SessionId('cancel-identity-retry'), { provider: 'mock', model: 'mock' })
+      send(agent, 'run')
+      await vi.waitFor(() => { expect(adapter.requests).toHaveLength(2) })
+      agent.cancel({ kind: 'user' })
+      await agent.whenIdle()
+      const events = agent.session.snapshotEvents()
+      expect(adapter.requests).toHaveLength(2)
+      expect(events.some(e => e.type === 'tool/call' || e.type === 'tool/result')).toBe(false)
+      expect(events.find(e => e.type === 'turn/end')?.data.reason).toEqual({ kind: 'aborted', reason: { kind: 'user' } })
+    } finally { await ctx.fiber.dispose() }
+  })
+
   it('publishes one dense live attempt and commits one v2 message with the exact embedded stream', async () => {
     const ctx = await harness(new MockAdapter([textResponse('live')]))
     const agent = await ctx.agentLoop.create(SessionId('live-assistant-attempt'), {

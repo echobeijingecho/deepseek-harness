@@ -175,6 +175,29 @@ afterEach(async () => {
 })
 
 describe('provider-routed retry policy', () => {
+  it('never retries a failed replacement request again under an always policy', async () => {
+    const adapter = new ScriptedAdapter([
+      [
+        { type: 'block-end', index: 0, block: { type: 'tool-call', id: ToolCallId(''), name: '', arguments: '{}' } },
+        { type: 'finish', reason: { kind: 'tool-calls' } },
+      ],
+      new LlmError('connection lost', 'TRANSPORT'),
+      textResponse('unexpected third request'),
+    ])
+    const mounted = await harness(adapter, { mock: alwaysConfig({ initialDelayMs: 1, maxDelayMs: 1, jitterRatio: 0 }) })
+    context = mounted.ctx
+    const agent = await context.agentLoop.create(SessionId('malformed-then-transport'), { provider: 'mock', model: 'mock' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    const events = agent.session.snapshotEvents()
+    expect(adapter.requests).toHaveLength(2)
+    expect(events.filter(e => e.type === 'assistant/attempt')).toHaveLength(2)
+    expect(events.some(e => e.type === 'llm/retry' || e.type === 'tool/call' || e.type === 'assistant/message')).toBe(false)
+    expect(events.find(e => e.type === 'turn/end')?.data.reason).toMatchObject({
+      kind: 'error', error: { code: 'TRANSPORT', message: 'connection lost' },
+    })
+  })
+
   it('records the scheduled delay before retrying the request', async () => {
     vi.useFakeTimers()
     const adapter = new ScriptedAdapter([

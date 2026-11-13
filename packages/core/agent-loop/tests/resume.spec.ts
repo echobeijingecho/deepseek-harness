@@ -16,7 +16,7 @@ import type { SessionHandle } from '@deepseek-ai/dsh-session-persistence'
 import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
-import { MockAdapter, textResponse } from './mock-adapter.ts'
+import { MockAdapter, textResponse, toolCallResponse } from './mock-adapter.ts'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -974,6 +974,39 @@ describe('the session-persistence Agent Note: AgentLoop factory create/resume', 
     expect(flat).toContain('background job 42 finished')
     await ctx2.fiber.dispose()
     await ctx1.fiber.dispose()
+  })
+
+  it('reopens the same session after two malformed tool responses and completes the next turn', async () => {
+    const sessionId = SessionId('malformed-tool-identity')
+    const agentOptions = { provider: 'mock', model: 'mock' }
+    const adapter = new MockAdapter([toolCallResponse('  ', 'count', {}), toolCallResponse('call-2', '  ', {})])
+    const { ctx, root } = await persistentHarness(adapter)
+    try {
+      const handle = await ctx.agents.create({ sessionId, agentOptions })
+      handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'run' }], source: { kind: 'user' } }))
+      await handle.agent.whenIdle()
+      await handle.dispose()
+      const stored = await readStoredEvents(ctx, sessionId)
+      expect(adapter.requests).toHaveLength(2)
+      expect(stored.filter(e => e.type === 'assistant/attempt')).toHaveLength(2)
+      expect(stored.some(e => e.type === 'assistant/message' || e.type === 'tool/call' || e.type === 'tool/result')).toBe(false)
+      expect(stored.find(e => e.type === 'turn/end')).toMatchObject({
+        data: { reason: { kind: 'error', error: { code: 'INVALID_TOOL_CALL_IDENTITY' } } },
+      })
+    } finally { await ctx.fiber.dispose() }
+
+    const next = new MockAdapter([textResponse('recovered')])
+    const resumed = await mountPersistentHarness(root, next)
+    try {
+      const handle = await resumed.agents.resume({ resumeSessionId: sessionId, agentOptions })
+      handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'continue' }], source: { kind: 'user' } }))
+      await handle.agent.whenIdle()
+      await handle.dispose()
+      const stored = await readStoredEvents(resumed, sessionId)
+      expect(next.requests).toHaveLength(1)
+      expect(stored.filter(e => e.type === 'turn/end').map(e => e.data.turn)).toEqual([1, 2])
+      expect(stored.findLast(e => e.type === 'turn/end')?.data.reason).toEqual({ kind: 'completed' })
+    } finally { await resumed.fiber.dispose() }
   })
 
   it('resume reloads a persisted session: history + turn numbering continue, no duplicate seqs', async () => {

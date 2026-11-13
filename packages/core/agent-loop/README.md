@@ -74,6 +74,8 @@ Every inbox mutation commits one normalized `agent/inbox/spliced` event. The pro
 
 Each step sends the session's derived history — with the latest non-empty `system/message` node as the effective prompt, or no system messages when the rendered prompt is empty — and its visible tool schemas; the model's tool calls run through the guarded tool pipeline and every accepted fact is appended to the session log before the next step derives from it. Parallel-safe calls may overlap up to `maxParallelToolCalls`; exclusive calls run alone as ordering barriers. Cancellation is cooperative: `agent.cancel()` aborts the current activity and, unless `keepInbox` is set, clears pending work; a cancelled stream finalizes the text already delivered to the user.
 
+The loop checks the final ID and name of every tool call before committing the assistant message or dispatching tools. If either field is missing or blank, the loop records a failed attempt and requests the same step once more. If the replacement request fails, the turn ends with that failure. A second invalid identity ends the turn with `INVALID_TOOL_CALL_IDENTITY`. Earlier completed steps remain in the session.
+
 -----
 
 <a id="understand-the-implementation"></a>
